@@ -1,6 +1,6 @@
 id = "wilbeibi.catchup"
 name = "Catchup"
-version = "0.7.0"
+version = "0.8.0"
 # 0.9.0 is the oldest herdr whose `agent prompt` takes `--wait --until`, which
 # `send` and `ask` use to report a prompt the agent never took up, and which
 # lets `ask` know the review turn has started before it waits for it to end and

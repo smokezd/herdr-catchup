@@ -45,12 +45,22 @@ Each action is available from the pane, workspace, tab, and selection menus.
 | Action | What it does |
 |---|---|
 | `wilbeibi.catchup.summary` | `catchup --since-compact` — that pane's session as clean Markdown. Leaves the running agent alone. |
-| `wilbeibi.catchup.fork` | `catchup fork` — resumes the session natively in the new pane, e.g. `claude --resume <id> --fork-session`. Full state. |
+| `wilbeibi.catchup.fork` | Choose a model and effort for Codex or Claude Code, then resume the session natively in the new pane. Other agents fork directly. Full state. |
 | `wilbeibi.catchup.handoff` | Asks which agent (codex / claude / agy / cline / copilot / cursor / opencode / pi-agent), then `catchup fork --into <choice>` — a **new** agent, started with the transcript in hand. |
 | `wilbeibi.catchup.send` | Lists the agents **already running** in this herdr session, renders the transcript to a file, and hands the one you pick its path. No new process; the agent in that pane picks the work up. |
 | `wilbeibi.catchup.ask` | Same delivery, review framing: the other agent is asked to attack the assumptions of your latest turn, name a cheaper alternative, and say where it breaks. When it finishes, this pane's agent is prompted to read the review and say what it would change. Two models arguing, one round. |
 
 `send` and `ask` are the two that only exist because of herdr: catchup can render any session, but only herdr knows which agents are alive right now and how to reach them.
+
+### Choose a fork's model and effort
+
+With `prefix+f` bound to `wilbeibi.catchup.fork`, a Codex or Claude Code pane opens a split with a numbered model picker, followed by the selected model's supported effort levels. Enter `0` to cancel at either menu. Choose **Fork with existing settings** to launch without overrides.
+
+Model selection requires Python 3, catchup 1.2 or newer (`--model` support), and an installed agent that supports catalog discovery. The picker queries Codex's app-server or Claude Code's streaming initialization using the agent's existing login and project configuration. It sends no inference prompt. Lists are fetched on each invocation; agent catalogs may themselves be cached and do not guarantee account access to every model. Discovery can initialize configured integrations such as MCP servers.
+
+If discovery fails, returns no models, or takes more than 15 seconds, the menu offers an unchanged fork or cancellation. Without Python 3, those same two options are offered directly. Older agents that omit effort metadata offer model selection only.
+
+Overrides apply to the new fork's launch; the plugin does not write agent settings. Other agents, automatic worktree forks, and Handoff keep their existing behavior.
 
 ### Configuration
 
@@ -166,6 +176,13 @@ herdr plugin action invoke wilbeibi.catchup.summary
 - A key per target agent (`handoff-codex`, …), so a handoff is one press and no menu, and more than one target can have a key. `config.env`'s `handoff_target` covers the single-default case today; `bin/run.sh handoff <target>` already takes the argument, so each extra key is three lines of manifest.
 - Session search, `catchup -q "topic"`, once actions can take arguments.
 - Handing off work that isn't a local session. `catchup fork --into <agent> --from <file | - | url>` seeds an agent from a transcript, a pipe, or a URL — a pane could pick up a job that started on another machine.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+bash -n bin/run.sh
+```
 
 ## License
 

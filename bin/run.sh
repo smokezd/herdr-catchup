@@ -292,7 +292,25 @@ in_pane() {
       exit "$rc"
       ;;
     fork)
-      catchup fork ${sel[@]+"${sel[@]}"} ${from_dir[@]+"${from_dir[@]}"} || rc=$?
+      case "${CATCHUP_PICK_FORK:-0}:${CATCHUP_PROVIDER:-}" in
+        1:codex|1:claude)
+          if command -v python3 >/dev/null 2>&1; then
+            python3 "$(dirname "${BASH_SOURCE[0]}")/fork_picker.py" \
+              "${sel[@]}" ${from_dir[@]+"${from_dir[@]}"} || rc=$?
+          else
+            echo "Model selection needs Python 3."
+            local fallback=""
+            PS3="fork> "
+            select fallback in "Fork with existing settings" "Cancel"; do
+              case "$REPLY" in
+                1) catchup fork "${sel[@]}" ${from_dir[@]+"${from_dir[@]}"} || rc=$?; break ;;
+                2) break ;;
+              esac
+            done
+          fi
+          ;;
+        *) catchup fork ${sel[@]+"${sel[@]}"} ${from_dir[@]+"${from_dir[@]}"} || rc=$? ;;
+      esac
       if [ "$rc" -eq 0 ]; then exit 0; fi
       ;;
     handoff)
@@ -441,6 +459,7 @@ if [ "$mode" = "worktree-created" ]; then
     --placement split \
     --direction right \
     --cwd "$wt" \
+    --env "CATCHUP_PICK_FORK=0" \
     --env "CATCHUP_DIR=$origin" \
     --focus
 fi
@@ -476,6 +495,7 @@ provider="$(catchup_provider "$kind")"
 # actually resolved is passed, so role 2's "did herdr name this session?" test
 # stays a plain empty check.
 open_args=(--plugin "$plugin_id" --entrypoint "$mode" --cwd "$cwd")
+[ "$mode" = "fork" ] && open_args+=(--env "CATCHUP_PICK_FORK=1")
 [ -n "$src_pane" ] && open_args+=(--env "CATCHUP_SRC_PANE=$src_pane")
 [ -n "$provider" ] && open_args+=(--env "CATCHUP_PROVIDER=$provider")
 [ -n "$sid" ] && open_args+=(--env "CATCHUP_SID=$sid")
