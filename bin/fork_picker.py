@@ -77,9 +77,12 @@ class CatalogProcess:
 
 
 def discover(agent, timeout=15):
+    # SessionStart hooks dominate Claude startup (seconds) and are side effects a
+    # catalog query must not trigger; MCP servers are likewise irrelevant to it.
     command = ([agent, 'app-server'] if agent == 'codex' else
                [agent, '--print', '--input-format', 'stream-json', '--output-format',
-                'stream-json', '--verbose', '--no-session-persistence'])
+                'stream-json', '--verbose', '--no-session-persistence',
+                '--settings', '{"disableAllHooks":true}', '--strict-mcp-config'])
     client = None
     try:
         client = CatalogProcess(command, timeout)
