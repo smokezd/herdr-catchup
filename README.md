@@ -54,11 +54,25 @@ Each action is available from the pane, workspace, tab, and selection menus.
 
 ### Choose a fork's model and effort
 
-With `prefix+f` bound to `wilbeibi.catchup.fork`, a Codex or Claude Code pane opens a split with a numbered model picker, followed by the selected model's supported effort levels. Enter `0` to cancel at either menu. Choose **Fork with existing settings** to launch without overrides.
+With `prefix+f` bound to `wilbeibi.catchup.fork`, a Codex or Claude Code pane opens a split with a numbered model picker, followed by effort selection for models that support it. The current option is highlighted directly in the list. Use ↑/↓ or j/k to move and Enter to select, or type a number and press Enter. Esc or q cancels immediately; `0` followed by Enter also cancels. Non-interactive terminals retain numbered input. Both menus offer **Fork with parent settings**: inherit the parent model, the parent effort, or both. You can keep the parent's model and choose a different effort, or choose a different model and keep the parent's effort if supported.
 
-Model selection requires Python 3, catchup 1.2 or newer (`--model` support), and an installed agent that supports catalog discovery. The picker queries Codex's app-server or Claude Code's streaming initialization using the agent's existing login and project configuration. It sends no inference prompt. Lists are fetched on each invocation; agent catalogs may themselves be cached and do not guarantee account access to every model. Discovery can initialize configured integrations such as MCP servers.
+The picker reads the parent's latest recorded model and effort from its session log and passes available values explicitly to the new fork. When a value cannot be read, the menu labels it unavailable and delegates that value to native resume behavior; this cannot guarantee the source pane's exact setting. Models that advertise no effort levels skip effort selection when explicitly selected.
 
-If discovery fails, returns no models, or takes more than 15 seconds, the menu offers an unchanged fork or cancellation. Without Python 3, those same two options are offered directly. Older agents that omit effort metadata offer model selection only.
+After model and effort, **Fork purpose** defaults to **Side questions — wait for my question** on every invocation. It supplies this instruction to the new Codex or Claude session without submitting a user prompt or starting a model turn:
+
+> This is a side-question fork. Treat the parent conversation as background context, not authorization to continue its work. Wait for my question. You may inspect code to answer questions. Do not edit files, commit, or change Jira, Confluence, or other external systems unless I explicitly request that action in this fork.
+
+Choose **Continue parent work** to fork without that instruction. The purpose choice is not remembered, so a continuation fork does not change the next fork's default. These are behavioral instructions; agent permissions are unchanged. The first model turn starts when you submit your actual question.
+
+Codex receives a session-only `developer_instructions` override, preserving its effective configured developer instructions. If those cannot be read, the side-question fork stops rather than overwriting them. Claude receives `--append-system-prompt` with `--system-prompt-snapshot off` so a resumed parent's recorded system prompt cannot suppress the new instruction; this rebuilds the system prompt from the current configuration. No global settings or repository instructions are written. Instruction changes may reduce prompt-cache reuse even though they avoid the acknowledgement turn. Without Python 3, the fallback launches a native fork without the side-question instruction.
+
+The picker remembers the last completed selection separately for Codex and Claude Code. Press Enter at each prompt to accept its marked default. Parent settings are the initial default, and remembering that option means inheriting from the next parent, rather than freezing today's values. Saved explicit choices are matched against the latest catalog. Removed choices fall back to the parent option; if the parent effort is unsupported, a supported effort is marked as default instead. Cancellation leaves preferences unchanged, and discovery failure preserves them.
+
+Choices are stored as `fork-choice-codex.json` and `fork-choice-claude.json` in `$HERDR_PLUGIN_STATE_DIR`, falling back to `$XDG_STATE_HOME/herdr-catchup` or `~/.local/state/herdr-catchup` outside the plugin environment. They are saved before launch, so a launch error does not discard your selection. Storage errors do not block the fork.
+
+Model selection requires Python 3, catchup 1.2 or newer (`--model` support), and an installed agent that supports catalog discovery. The picker queries Codex's app-server or Claude Code's streaming initialization using the agent's existing login and project configuration. It sends no inference prompt. Lists are fetched on each invocation; agent catalogs may themselves be cached and do not guarantee account access to every model. Codex discovery can initialize configured integrations such as MCP servers; Claude discovery runs with hooks and MCP servers disabled.
+
+If discovery fails, returns no models, or takes more than 15 seconds, the menu offers parent settings or cancellation. Without Python 3, those same two options are offered directly. Older agents that omit effort metadata offer model selection only.
 
 Overrides apply to the new fork's launch; the plugin does not write agent settings. Other agents, automatic worktree forks, and Handoff keep their existing behavior.
 

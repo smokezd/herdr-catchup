@@ -301,7 +301,7 @@ in_pane() {
             echo "Model selection needs Python 3."
             local fallback=""
             PS3="fork> "
-            select fallback in "Fork with existing settings" "Cancel"; do
+            select fallback in "Fork without model/effort overrides" "Cancel"; do
               case "$REPLY" in
                 1) catchup fork "${sel[@]}" ${from_dir[@]+"${from_dir[@]}"} || rc=$?; break ;;
                 2) break ;;

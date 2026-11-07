@@ -5,13 +5,25 @@ import json
 import os
 from pathlib import Path
 import selectors
+import select
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
+import tty
+import unicodedata
+
+
+SIDE_QUESTION_PROMPT = (
+    'This is a side-question fork. Treat the parent conversation as background context, '
+    'not authorization to continue its work. Wait for my question. You may inspect code '
+    'to answer questions. Do not edit files, commit, or change Jira, Confluence, or other '
+    'external systems unless I explicitly request that action in this fork.'
+)
 
 
 class DiscoveryError(Exception):
@@ -132,7 +144,8 @@ def discover(agent, timeout=15):
             if response.get('subtype') != 'success':
                 raise DiscoveryError('Claude rejected catalog initialization; check login and CLI version')
             models = [{'id': row['value'], 'name': row.get('displayName') or row['value'],
-                       'efforts': row.get('supportedEffortLevels', []) if row.get('supportsEffort') else []}
+                       'efforts': row.get('supportedEffortLevels', []) if row.get('supportsEffort') else [],
+                       **({'resolvedModel': row['resolvedModel']} if row.get('resolvedModel') else {})}
                       for row in response['response']['models']]
         if not models:
             raise DiscoveryError('the agent returned no models')
@@ -153,35 +166,234 @@ def display(value):
     return ''.join(c if c.isprintable() else ' ' for c in value)
 
 
-def choose(title, labels):
+def parent_settings(selection):
+    try:
+        result = subprocess.run(['catchup'] + selection + ['--info', '--json'],
+                                capture_output=True, text=True, timeout=5, check=True)
+        metadata = json.loads(result.stdout)
+        return read_parent_log(metadata['path'], selection[0])
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        return {}
+
+
+def read_parent_log(path, agent):
+    settings = {}
+    with open(path) as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+                if agent == 'codex' and record.get('type') == 'turn_context':
+                    payload = record.get('payload', {})
+                    candidate = {'model': payload.get('model'), 'effort': payload.get('effort')}
+                elif agent == 'claude' and record.get('type') == 'assistant' and not record.get('isSidechain'):
+                    candidate = {'model': record.get('requestedModel') or record.get('message', {}).get('model'),
+                                 'effort': record.get('perTurnEffort') or record.get('effort')}
+                else:
+                    continue
+                for key, value in candidate.items():
+                    if isinstance(value, str) and value:
+                        settings[key] = value
+            except (ValueError, AttributeError):
+                continue
+    return settings
+
+
+def choice_path(agent):
+    directory = os.environ.get('HERDR_PLUGIN_STATE_DIR')
+    if not directory:
+        directory = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'herdr-catchup'
+    return Path(directory) / ('fork-choice-' + agent + '.json')
+
+
+def load_choice(agent):
+    try:
+        saved = json.loads(choice_path(agent).read_text())
+        if (isinstance(saved, dict) and 'model' in saved and 'effort' in saved and
+                all(saved[key] is None or isinstance(saved[key], str) for key in ('model', 'effort'))):
+            return saved
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_choice(agent, model, effort):
+    temporary = None
+    try:
+        path = choice_path(agent)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Separate files avoid cross-agent races; replacement prevents partial reads.
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump({'model': model, 'effort': effort}, stream)
+        os.replace(temporary, path)
+    except OSError:
+        print('Could not remember this choice; the fork will still launch.', file=sys.stderr)
+    finally:
+        if temporary:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def fit_line(text, width):
+    result, used = [], 0
+    for character in display(text):
+        size = 0 if unicodedata.combining(character) else 2 if unicodedata.east_asian_width(character) in ('W', 'F') else 1
+        if used + size > width:
+            break
+        result.append(character)
+        used += size
+    return ''.join(result)
+
+
+def terminal_choice(labels, default):
+    fd = sys.stdin.fileno()
+    original = termios.tcgetattr(fd)
+    current = default if default is not None else 0
+    digits = ''
+    rendered_rows = 0
+    try:
+        tty.setcbreak(fd)
+        while True:
+            columns, height = shutil.get_terminal_size()
+            width = max(1, columns - 1)
+            capacity = max(1, height - 5)
+            start = min(max(0, current - capacity + 1), max(0, len(labels) - capacity))
+            rows = [('  0) Cancel', False)]
+            for index in range(start, min(len(labels), start + capacity)):
+                label = '{}{}) {}{}'.format('› ' if index == current else '  ', index + 1,
+                                            labels[index], ' [default]' if index == default else '')
+                rows.append((label, index == current))
+            hint = '↑/↓ or j/k · Enter select · number + Enter · Esc cancel'
+            if len(labels) > capacity:
+                hint = '{}/{} · '.format(current + 1, len(labels)) + hint
+            rows.append((hint, False))
+            if digits:
+                rows[-1] = ('Number: ' + digits + ' · Enter select · Backspace edit', False)
+            if rendered_rows:
+                sys.stdout.write('\r\x1b[{}A'.format(rendered_rows - 1))
+            sys.stdout.write('\r\x1b[J')
+            for row_index, (label, highlighted) in enumerate(rows):
+                if row_index:
+                    sys.stdout.write('\n\r')
+                sys.stdout.write(('\x1b[7m' if highlighted else '') + fit_line(label, width) + '\x1b[0m')
+            rendered_rows = len(rows)
+            sys.stdout.flush()
+            key = os.read(fd, 1)
+            if key == b'\x1b':
+                sequence = b''
+                while select.select([fd], [], [], 0.1)[0] and len(sequence) < 16:
+                    chunk = os.read(fd, 1)
+                    if not chunk:
+                        return None
+                    sequence += chunk
+                    if len(sequence) >= 2 and 0x40 <= sequence[-1] <= 0x7e:
+                        break
+                if not sequence:
+                    return None
+                key = {b'[A': b'k', b'OA': b'k', b'[B': b'j', b'OB': b'j'}.get(sequence, b'?')
+            if key in (b'j', b'k'):
+                current = (current + (1 if key == b'j' else -1)) % len(labels)
+                digits = ''
+            elif key in (b'\r', b'\n'):
+                if not digits:
+                    return current
+                number = int(digits)
+                if number <= len(labels):
+                    return number - 1 if number else None
+                digits = ''
+            elif key in (b'', b'\x04', b'q', b'\x03'):
+                return None
+            elif key in (b'\x7f', b'\x08'):
+                digits = digits[:-1]
+            elif key in b'0123456789' and len(digits) < 6:
+                digits += key.decode('ascii')
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+        sys.stdout.write('\x1b[0m\n')
+        sys.stdout.flush()
+
+
+def choose(title, labels, default=None):
     print('\n' + title)
+    if sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get('TERM') != 'dumb':
+        return terminal_choice(labels, default)
     print('  0) Cancel')
     for index, label in enumerate(labels, 1):
-        print('  {}) {}'.format(index, display(label)))
+        print('  {}) {}{}'.format(index, display(label), ' [default]' if index - 1 == default else ''))
     while True:
         try:
-            answer = input('choice> ').strip()
+            answer = input('choice{}> '.format(' [{}]'.format(default + 1) if default is not None else '')).strip()
         except (EOFError, KeyboardInterrupt):
             print('\nCancelled.')
             return None
+        if not answer and default is not None:
+            return default
         if answer.isascii() and answer.isdecimal() and int(answer) <= len(labels):
             return int(answer) - 1 if int(answer) else None
         print('Enter a number from 0 to {}.'.format(len(labels)))
 
 
-def launch(agent, selection, model=None, effort=None):
+def fork_mode():
+    return choose('Fork purpose', ['Side questions — wait for my question', 'Continue parent work'], default=0)
+
+
+def codex_developer_instructions():
+    client = None
+    try:
+        client = CatalogProcess(['codex', 'app-server'], 15)
+        client.send({'id': 1, 'method': 'initialize', 'params': {
+            'clientInfo': {'name': 'herdr-catchup', 'version': '0.8.0'}}})
+        while True:
+            reply = client.receive()
+            if reply.get('id') == 1:
+                if 'error' in reply:
+                    raise DiscoveryError('Codex rejected configuration initialization')
+                break
+        client.send({'method': 'initialized', 'params': {}})
+        client.send({'id': 2, 'method': 'config/read', 'params': {'includeLayers': False}})
+        while True:
+            reply = client.receive()
+            if reply.get('id') == 2:
+                break
+        if 'error' in reply:
+            raise DiscoveryError('Codex could not read its effective developer instructions')
+        instructions = reply['result']['config'].get('developer_instructions')
+        if instructions is not None and not isinstance(instructions, str):
+            raise DiscoveryError('Codex returned invalid developer instructions')
+        return instructions or ''
+    except (OSError, KeyError, ValueError, TypeError, AttributeError) as error:
+        raise DiscoveryError('Cannot preserve Codex developer instructions; side-question fork was not launched') from error
+    finally:
+        if client:
+            client.close()
+
+
+def launch(agent, selection, model=None, effort=None, prompt=None):
     args = ['catchup', 'fork'] + selection
     if model:
         args += ['--model', model]
     env = os.environ.copy()
     with tempfile.TemporaryDirectory(prefix='herdr-catchup-fork-') as directory:
-        if effort:
+        if effort or prompt:
             executable = shutil.which(agent)
             if not executable:
                 raise OSError('{} not found on PATH'.format(agent))
-            flags = ['-c', 'model_reasoning_effort=' + effort] if agent == 'codex' else ['--effort', effort]
+            flags = []
+            if effort:
+                flags = ['-c', 'model_reasoning_effort=' + effort] if agent == 'codex' else ['--effort', effort]
+            if prompt:
+                if agent == 'codex':
+                    existing = codex_developer_instructions()
+                    instructions = existing + '\n\n' + prompt if existing else prompt
+                    flags += ['-c', 'developer_instructions=' + json.dumps(instructions, ensure_ascii=False)]
+                else:
+                    # A resumed Claude session otherwise reuses the parent's recorded
+                    # system prompt and ignores newly appended instructions.
+                    flags += ['--append-system-prompt', prompt, '--system-prompt-snapshot', 'off']
             # catchup owns native fork semantics; intercept only this child launch
-            # to supply effort, which catchup does not expose as an argument.
+            # to supply effort and instructions without submitting a user turn.
             shim = Path(directory) / agent
             shim.write_text('#!/bin/sh\nexport PATH=' + shlex.quote(env.get('PATH', '')) +
                             '\nexec ' + shlex.quote(executable) + ' "$@" ' +
@@ -207,26 +419,60 @@ def launch(agent, selection, model=None, effort=None):
 
 def main(selection):
     agent = selection[0]
+    saved = load_choice(agent)
     print('Fetching {} models…'.format(agent), flush=True)
+    parent = parent_settings(selection)
     try:
         models = discover(agent)
     except DiscoveryError as error:
         print('Could not fetch models: {}.'.format(error))
         models = []
-    choice = choose('Fork model (agent-reported catalog)', ['Fork with existing settings'] +
-                    ['{} [{}]'.format(m['name'], m['id']) for m in models])
+    default = next((index + 1 for index, model in enumerate(models) if model['id'] == saved.get('model')), 0)
+    if saved.get('model') and not default and models:
+        print('Previously selected model is unavailable; defaulting to parent settings.')
+    parent_label = 'Fork with parent settings'
+    if parent.get('model'):
+        parent_label += ' [{}]'.format(parent['model'])
+    else:
+        parent_label += ' (native resume; parent model unavailable)'
+    choice = choose('Fork model (agent-reported catalog)', [parent_label] +
+                    ['{} [{}]'.format(m['name'], m['id']) for m in models], default=default)
     if choice is None:
         return 0
-    if choice == 0:
-        return launch(agent, selection)
-    model = models[choice - 1]
-    effort = None
-    if model['efforts']:
-        index = choose('Effort for ' + model['name'], model['efforts'])
-        if index is None:
-            return 0
-        effort = model['efforts'][index]
-    return launch(agent, selection, model['id'], effort)
+    selected_model = models[choice - 1] if choice else None
+    model_id = selected_model['id'] if selected_model else parent.get('model')
+    effective_model = selected_model or next((m for m in models if m['id'] == model_id or m.get('resolvedModel') == model_id), None)
+    efforts = effective_model['efforts'] if effective_model else []
+    parent_effort = parent.get('effort')
+    effort = parent_effort
+    saved_effort = saved.get('effort') if saved.get('model') == (selected_model['id'] if selected_model else None) else None
+    effort_default = efforts.index(saved_effort) + 1 if saved_effort in efforts else 0
+    if efforts and parent_effort and parent_effort not in efforts and not effort_default:
+        effort_default = 1
+    if efforts or not selected_model:
+        label = 'Fork with parent settings'
+        label += ' [{}]'.format(parent_effort) if parent_effort else ' (native resume; parent effort unavailable)'
+        while True:
+            index = choose('Fork effort', [label] + efforts, default=effort_default)
+            if index is None:
+                return 0
+            if index == 0 and efforts and parent_effort and parent_effort not in efforts:
+                print('The parent effort is not supported by this model; choose a supported effort or cancel.')
+                continue
+            effort = efforts[index - 1] if index else parent_effort
+            break
+    else:
+        index = 0
+        effort = None
+    mode = fork_mode()
+    if mode is None:
+        return 0
+    if models:
+        save_choice(agent, selected_model['id'] if selected_model else None,
+                    efforts[index - 1] if index else None)
+    if mode == 0:
+        return launch(agent, selection, model_id, effort, prompt=SIDE_QUESTION_PROMPT)
+    return launch(agent, selection, model_id, effort)
 
 
 if __name__ == '__main__':
@@ -240,6 +486,6 @@ if __name__ == '__main__':
         sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         sys.exit(130)
-    except OSError as error:
+    except (OSError, DiscoveryError) as error:
         print('herdr-catchup: {}'.format(error), file=sys.stderr)
         sys.exit(1)
